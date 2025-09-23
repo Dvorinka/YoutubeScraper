@@ -161,6 +161,8 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 		snippet := html[start:end]
 
 		vi := VideoItem{VideoID: id}
+		// Prefer deterministic thumbnail URL derived from video ID
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
 
 		// Title (may appear as simpleText or runs)
 		if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
@@ -170,13 +172,25 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 		}
 
 		// Length
-		if m := regexp.MustCompile(`"lengthText":\{"accessibility":\{[^}]*\},"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+		if m := regexp.MustCompile(`"lengthText":\{[^}]*"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			// Generic lengthText.simpleText (with or without accessibility block)
 			vi.Length = m[1]
+		} else if m := regexp.MustCompile(`"lengthText":\{[^}]*"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			// lengthText.runs[0].text
+			vi.Length = m[1]
+		} else if m := regexp.MustCompile(`"thumbnailOverlays":\[[^\]]*?"thumbnailOverlayTimeStatusRenderer":\{"text":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			// Overlay badge duration
+			vi.Length = m[1]
+		} else if m := regexp.MustCompile(`yt-badge-shape__text">([^<]+)<`).FindStringSubmatch(snippet); len(m) >= 2 {
+			// Fallback: raw HTML badge text seen in thumbnails
+			vi.Length = strings.TrimSpace(m[1])
 		}
 
-		// Thumbnail URL (first in thumbnails array)
-		if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
+		// Thumbnail URL (first in thumbnails array) as a fallback only if not set
+		if vi.ThumbnailURL == "" {
+			if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+				vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
+			}
 		}
 
 		// Published time text (e.g., "3 days ago")
@@ -213,13 +227,17 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 		snippet := html[start:end]
 
 		vi := VideoItem{VideoID: id}
+		// Prefer deterministic thumbnail URL for shorts as well
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
 		if m := regexp.MustCompile(`"headline":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
 			vi.Title = unescapeYT(m[1])
 		} else if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
 			vi.Title = unescapeYT(m[1])
 		}
-		if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
+		if vi.ThumbnailURL == "" {
+			if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+				vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
+			}
 		}
 		videos = append(videos, vi)
 	}
