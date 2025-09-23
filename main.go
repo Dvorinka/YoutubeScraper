@@ -186,6 +186,28 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 			vi.Length = strings.TrimSpace(m[1])
 		}
 
+		// Extra fallback: search the global HTML near the video anchor for DOM-based duration
+		if vi.Length == "" {
+			anchorRe := regexp.MustCompile(fmt.Sprintf(`<a[^>]+href="/watch\?v=%s[^\"]*"`, regexp.QuoteMeta(id)))
+			if loc := anchorRe.FindStringIndex(html); loc != nil {
+				// Search a forward window after the anchor for duration elements
+				start2 := loc[1]
+				end2 := start2 + 4000
+				if end2 > len(html) { end2 = len(html) }
+				chunk := html[start2:end2]
+				// Try yt-formatted-string id="length" inner text like 5:59
+				if m := regexp.MustCompile(`yt-formatted-string[^>]*id="length"[^>]*>([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)<`).FindStringSubmatch(chunk); len(m) >= 2 {
+					vi.Length = strings.TrimSpace(m[1])
+				} else if m := regexp.MustCompile(`yt-formatted-string[^>]*id="length"[^>]*aria-label="([^"]+)"`).FindStringSubmatch(chunk); len(m) >= 2 {
+					if parsed := parseLocalizedDuration(unescapeYT(m[1])); parsed != "" {
+						vi.Length = parsed
+					}
+				} else if m := regexp.MustCompile(`yt-badge-shape__text">([^<]+)<`).FindStringSubmatch(chunk); len(m) >= 2 {
+					vi.Length = strings.TrimSpace(m[1])
+				}
+			}
+		}
+
 		// Thumbnail URL (first in thumbnails array) as a fallback only if not set
 		if vi.ThumbnailURL == "" {
 			if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
@@ -363,6 +385,65 @@ func parseRelativeToISO(rel string) string {
 		case "year":
 			return now.AddDate(-n, 0, 0).Format("2006-01-02")
 		}
+	}
+	return ""
+}
+
+// parseLocalizedDuration converts localized duration phrases (e.g., "5 minut a 59 sekund")
+// into a mm:ss or hh:mm:ss string. Supports English and basic Czech variants.
+func parseLocalizedDuration(s string) string {
+	t := strings.ToLower(strings.TrimSpace(s))
+	// Replace HTML entities and non-breaking spaces
+	t = strings.ReplaceAll(t, "&nbsp;", " ")
+	t = strings.ReplaceAll(t, "\u00a0", " ")
+	t = strings.TrimSpace(t)
+
+	// If already in 00:00 or 0:00:00 form, return as-is trimmed
+	if m := regexp.MustCompile(`^\d{1,2}:\d{2}(?::\d{2})?$`).FindString(t); m != "" {
+		return m
+	}
+
+	// Patterns like: 1 hour 2 minutes 3 seconds (EN)
+	// or Czech: 1 hodina/hodiny/hodin, 2 minuty/minut, 3 sekundy/sekund
+	// We'll extract numbers for h/m/s separately.
+	var h, m, sec int
+
+	// English capture
+	if mm := regexp.MustCompile(`(\d+)\s*hour`).FindStringSubmatch(t); len(mm) >= 2 {
+		h, _ = strconv.Atoi(mm[1])
+	}
+	if mm := regexp.MustCompile(`(\d+)\s*minute`).FindStringSubmatch(t); len(mm) >= 2 {
+		m, _ = strconv.Atoi(mm[1])
+	}
+	if mm := regexp.MustCompile(`(\d+)\s*second`).FindStringSubmatch(t); len(mm) >= 2 {
+		sec, _ = strconv.Atoi(mm[1])
+	}
+
+	// Czech capture
+	if mm := regexp.MustCompile(`(\d+)\s*hodin(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
+		if h == 0 { h, _ = strconv.Atoi(mm[1]) }
+	}
+	if mm := regexp.MustCompile(`(\d+)\s*minut(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
+		if m == 0 { m, _ = strconv.Atoi(mm[1]) }
+	}
+	if mm := regexp.MustCompile(`(\d+)\s*sekund(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
+		if sec == 0 { sec, _ = strconv.Atoi(mm[1]) }
+	}
+
+	// If we still didn't parse anything but string contains a plain number like "5 minutes",
+	// ensure we at least capture minutes.
+	if h == 0 && m == 0 && sec == 0 {
+		if mm := regexp.MustCompile(`^(\d+)$`).FindStringSubmatch(t); len(mm) >= 2 {
+			m, _ = strconv.Atoi(mm[1])
+		}
+	}
+
+	// Build the time string
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	if m > 0 || sec > 0 {
+		return fmt.Sprintf("%d:%02d", m, sec)
 	}
 	return ""
 }
