@@ -22,11 +22,15 @@ var ctx = context.Background()
 
 // ChannelVideosResponse represents the response for channel videos scraping
 type ChannelVideosResponse struct {
-	Channel     string   `json:"channel"`
-	ChannelURL  string   `json:"channel_url"`
-	SubscribersText string `json:"subscribers_text"`
-	Subscribers     int64  `json:"subscribers"`
-	Videos          []VideoItem `json:"videos"`
+	Channel            string      `json:"channel"`
+	ChannelURL         string      `json:"channel_url"`
+	ChannelID          string      `json:"channel_id,omitempty"`
+	ChannelAvatar      string      `json:"channel_avatar,omitempty"`
+	ChannelDescription string      `json:"channel_description,omitempty"`
+	RSSURL             string      `json:"rss_url,omitempty"`
+	SubscribersText    string      `json:"subscribers_text"`
+	Subscribers        int64       `json:"subscribers"`
+	Videos             []VideoItem `json:"videos"`
 }
 
 // VideoItem holds per-video metadata extracted from the /videos page
@@ -106,6 +110,214 @@ func normalizeChannelInput(input string) (handle string, url string) {
 	return
 }
 
+// extractYTInitialData parses the ytInitialData JSON object embedded in YouTube HTML.
+// This is the most robust approach since it walks the actual data structure regardless
+// of renderer name changes (e.g., videoRenderer -> lockupViewModel -> whatever comes next).
+func extractYTInitialData(html string) (map[string]interface{}, error) {
+	// Find the ytInitialData variable assignment in script tags
+	// Try multiple patterns in case YouTube changes the exact format
+	patterns := []string{
+		`var ytInitialData\s*=\s*({.+?});\s*</script>`,
+		`window\["ytInitialData"\]\s*=\s*({.+?});`,
+		`ytInitialData\s*=\s*({.+?});`,
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		if m := re.FindStringSubmatch(html); len(m) >= 2 {
+			var data map[string]interface{}
+			if err := json.Unmarshal([]byte(m[1]), &data); err == nil {
+				return data, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("ytInitialData not found or unparseable")
+}
+
+// findVideosInJSON recursively walks a parsed JSON tree and extracts video metadata
+// from any objects that look like video items. It is renderer-name-agnostic.
+func findVideosInJSON(data interface{}) []VideoItem {
+	var videos []VideoItem
+	seen := make(map[string]struct{})
+
+	var walk func(v interface{})
+	walk = func(v interface{}) {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			// Check if this object represents a video by looking for videoId patterns
+			// or lockupViewModel-like structure with contentId
+			vid := extractVideoFromObject(val)
+			if vid.VideoID != "" {
+				if _, ok := seen[vid.VideoID]; !ok {
+					seen[vid.VideoID] = struct{}{}
+					videos = append(videos, vid)
+				}
+			}
+			// Continue walking all fields
+			for _, fv := range val {
+				walk(fv)
+			}
+		case []interface{}:
+			for _, item := range val {
+				walk(item)
+			}
+		}
+	}
+
+	walk(data)
+	return videos
+}
+
+// extractVideoFromObject tries to extract a VideoItem from a JSON object.
+// It uses multiple heuristics to work across different YouTube data structures.
+func extractVideoFromObject(obj map[string]interface{}) VideoItem {
+	var vi VideoItem
+
+	// Heuristic 1: Look for contentId (new lockupViewModel structure)
+	if id, ok := obj["contentId"].(string); ok && len(id) == 11 {
+		vi.VideoID = id
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
+	}
+
+	// Heuristic 2: Look for videoId (older videoRenderer structure)
+	if vi.VideoID == "" {
+		if id, ok := obj["videoId"].(string); ok && len(id) == 11 {
+			vi.VideoID = id
+			vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
+		}
+	}
+
+	if vi.VideoID == "" {
+		return vi
+	}
+
+	// --- Extract Title ---
+	// Try multiple title paths
+	vi.Title = extractStringFromPath(obj,
+		[]string{"metadata", "lockupMetadataViewModel", "title", "content"},
+		[]string{"title", "content"},
+		[]string{"title", "simpleText"},
+		[]string{"title", "runs", "0", "text"},
+		[]string{"accessibility", "accessibilityData", "label"},
+		[]string{"rendererContext", "accessibilityContext", "label"},
+	)
+	// Remove duration suffix from accessibility labels
+	if vi.Title != "" {
+		durationRe := regexp.MustCompile(`\s+\d+\s+(?:minute|second|hour)s?(?:,\s*\d+\s+(?:minute|second|hour)s?)*\s*$`)
+		vi.Title = strings.TrimSpace(durationRe.ReplaceAllString(vi.Title, ""))
+	}
+
+	// --- Extract Length ---
+	// Try lockupViewModel badge path
+	if badges := extractFromPath(obj, []string{"contentImage", "thumbnailViewModel", "overlays"}); badges != nil {
+		if arr, ok := badges.([]interface{}); ok {
+			for _, badge := range arr {
+				if b, ok := badge.(map[string]interface{}); ok {
+					if text := extractStringFromPath(b, []string{"thumbnailBottomOverlayViewModel", "badges", "0", "thumbnailBadgeViewModel", "text"}); text != "" {
+						vi.Length = text
+						break
+					}
+				}
+			}
+		}
+	}
+	// Fallback to older lengthText paths
+	if vi.Length == "" {
+		vi.Length = extractStringFromPath(obj,
+			[]string{"lengthText", "simpleText"},
+			[]string{"lengthText", "runs", "0", "text"},
+		)
+	}
+
+	// --- Extract Views and Published Time ---
+	// Try metadata rows (new structure)
+	if meta := extractFromPath(obj, []string{"metadata", "lockupMetadataViewModel", "metadata", "contentMetadataViewModel", "metadataRows"}); meta != nil {
+		if rows, ok := meta.([]interface{}); ok && len(rows) > 0 {
+			if firstRow, ok := rows[0].(map[string]interface{}); ok {
+				if parts := extractFromPath(firstRow, []string{"metadataParts"}); parts != nil {
+					if arr, ok := parts.([]interface{}); ok {
+						for i, part := range arr {
+							if p, ok := part.(map[string]interface{}); ok {
+								text := extractStringFromPath(p, []string{"text", "content"})
+								if text != "" {
+									// First part is usually views, second is published time
+									if i == 0 {
+										vi.ViewsText = text
+										vi.Views = parseCountText(text)
+									} else if i == 1 {
+										vi.PublishedText = text
+										vi.PublishedDate = parseRelativeToISO(text)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fallback to older viewCountText/publishedTimeText paths
+	if vi.ViewsText == "" {
+		if text := extractStringFromPath(obj, []string{"viewCountText", "simpleText"}); text != "" {
+			vi.ViewsText = text
+			vi.Views = parseCountText(text)
+		}
+	}
+	if vi.PublishedText == "" {
+		if text := extractStringFromPath(obj, []string{"publishedTimeText", "simpleText"}); text != "" {
+			vi.PublishedText = text
+			vi.PublishedDate = parseRelativeToISO(text)
+		}
+	}
+
+	return vi
+}
+
+// extractFromPath navigates a nested map[string]interface{} by key path and returns the value.
+func extractFromPath(obj map[string]interface{}, path []string) interface{} {
+	current := obj
+	for i, key := range path {
+		if i == len(path)-1 {
+			return current[key]
+		}
+		if next, ok := current[key].(map[string]interface{}); ok {
+			current = next
+		} else if nextArr, ok := current[key].([]interface{}); ok {
+			// If the next step is an array, try to index into it
+			if i+1 < len(path) {
+				idxStr := path[i+1]
+				if idx, err := strconv.Atoi(idxStr); err == nil && idx >= 0 && idx < len(nextArr) {
+					if idx == len(path)-2 {
+						return nextArr[idx]
+					}
+					if nextMap, ok := nextArr[idx].(map[string]interface{}); ok {
+						current = nextMap
+						// Skip the index in path since we already consumed it
+						path = append(path[:i+1], path[i+2:]...)
+						continue
+					}
+				}
+			}
+			return nil
+		} else {
+			return nil
+		}
+	}
+	return nil
+}
+
+// extractStringFromPath tries multiple paths and returns the first non-empty string found.
+func extractStringFromPath(obj map[string]interface{}, paths ...[]string) string {
+	for _, path := range paths {
+		if v := extractFromPath(obj, path); v != nil {
+			if s, ok := v.(string); ok && s != "" {
+				return unescapeYT(s)
+			}
+		}
+	}
+	return ""
+}
+
 // fetchChannelVideos scrapes the channel's /videos page and extracts video IDs present
 func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 	handle, channelURL := normalizeChannelInput(channelInput)
@@ -134,142 +346,49 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 	}
 	html := string(body)
 
-	// Regex to capture all 11-char YouTube video IDs from initial data payload
-	// Standard videos
-	vidRe := regexp.MustCompile(`"videoRenderer":\{[^}]*?"videoId":"([a-zA-Z0-9_-]{11})"`)
-	matches := vidRe.FindAllStringSubmatchIndex(html, -1)
-	seen := make(map[string]struct{})
+	// --- PRIMARY: Try to parse ytInitialData JSON ---
+	// This is the most future-proof approach since it walks the actual data
+	// structure regardless of renderer name changes.
 	var videos []VideoItem
-	for _, idx := range matches {
-		if len(idx) < 4 { // need at least match start/end and group start/end
-			continue
-		}
-		// Extract ID
-		id := html[idx[2]:idx[3]]
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
+	var channelID, channelAvatar, channelDesc, rssURL string
 
-		// Build a local window around the match to parse related fields
-		start := idx[0]
-		if start-2000 > 0 { start = start - 2000 }
-		end := idx[1] + 8000
-		if end > len(html) {
-			end = len(html)
-		}
-		snippet := html[start:end]
+	if ytData, err := extractYTInitialData(html); err == nil {
+		log.Println("Successfully extracted ytInitialData, using JSON parser")
+		videos = findVideosInJSON(ytData)
 
-		vi := VideoItem{VideoID: id}
-		// Prefer deterministic thumbnail URL derived from video ID
-		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
-
-		// Title (may appear as simpleText or runs)
-		if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.Title = unescapeYT(m[1])
-		} else if m := regexp.MustCompile(`"title":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.Title = unescapeYT(m[1])
-		}
-
-		// Length
-		if m := regexp.MustCompile(`"lengthText":\{[^}]*"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			// Generic lengthText.simpleText (with or without accessibility block)
-			vi.Length = m[1]
-		} else if m := regexp.MustCompile(`"lengthText":\{[^}]*"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			// lengthText.runs[0].text
-			vi.Length = m[1]
-		} else if m := regexp.MustCompile(`"thumbnailOverlays":\[[^\]]*?"thumbnailOverlayTimeStatusRenderer":\{"text":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			// Overlay badge duration
-			vi.Length = m[1]
-		} else if m := regexp.MustCompile(`yt-badge-shape__text">([^<]+)<`).FindStringSubmatch(snippet); len(m) >= 2 {
-			// Fallback: raw HTML badge text seen in thumbnails
-			vi.Length = strings.TrimSpace(m[1])
-		}
-
-		// Extra fallback: search the global HTML near the video anchor for DOM-based duration
-		if vi.Length == "" {
-			anchorRe := regexp.MustCompile(fmt.Sprintf(`<a[^>]+href="/watch\?v=%s[^\"]*"`, regexp.QuoteMeta(id)))
-			if loc := anchorRe.FindStringIndex(html); loc != nil {
-				// Search a forward window after the anchor for duration elements
-				start2 := loc[1]
-				end2 := start2 + 4000
-				if end2 > len(html) { end2 = len(html) }
-				chunk := html[start2:end2]
-				// Try yt-formatted-string id="length" inner text like 5:59
-				if m := regexp.MustCompile(`yt-formatted-string[^>]*id="length"[^>]*>([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)<`).FindStringSubmatch(chunk); len(m) >= 2 {
-					vi.Length = strings.TrimSpace(m[1])
-				} else if m := regexp.MustCompile(`yt-formatted-string[^>]*id="length"[^>]*aria-label="([^"]+)"`).FindStringSubmatch(chunk); len(m) >= 2 {
-					if parsed := parseLocalizedDuration(unescapeYT(m[1])); parsed != "" {
-						vi.Length = parsed
+		// Extract additional channel metadata from JSON
+		if meta := extractFromPath(ytData, []string{"metadata", "channelMetadataRenderer"}); meta != nil {
+			if m, ok := meta.(map[string]interface{}); ok {
+				channelID = extractStringFromPath(m, []string{"externalId"})
+				channelDesc = extractStringFromPath(m, []string{"description"})
+				if av := extractFromPath(m, []string{"avatar", "thumbnails"}); av != nil {
+					if arr, ok := av.([]interface{}); ok && len(arr) > 0 {
+						if first, ok := arr[0].(map[string]interface{}); ok {
+							channelAvatar = extractStringFromPath(first, []string{"url"})
+						}
 					}
-				} else if m := regexp.MustCompile(`yt-badge-shape__text">([^<]+)<`).FindStringSubmatch(chunk); len(m) >= 2 {
-					vi.Length = strings.TrimSpace(m[1])
+				}
+				if rss := extractFromPath(m, []string{"rssUrl"}); rss != nil {
+					if s, ok := rss.(string); ok {
+						rssURL = s
+					}
 				}
 			}
 		}
-
-		// Thumbnail URL (first in thumbnails array) as a fallback only if not set
-		if vi.ThumbnailURL == "" {
-			if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-				vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
-			}
-		}
-
-		// Published time text (e.g., "3 days ago")
-		if m := regexp.MustCompile(`"publishedTimeText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.PublishedText = m[1]
-			vi.PublishedDate = parseRelativeToISO(m[1])
-		}
-
-		// Views
-		if m := regexp.MustCompile(`"viewCountText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.ViewsText = m[1]
-			vi.Views = parseCountText(m[1])
-		} else if m := regexp.MustCompile(`"viewCountText":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.ViewsText = m[1] + " views"
-			vi.Views = parseCountText(m[1])
-		}
-
-		videos = append(videos, vi)
 	}
 
-	// Shorts videos (reelItemRenderer) to support /shorts tab
-	shortsRe := regexp.MustCompile(`"reelItemRenderer":\{[^}]*?"videoId":"([a-zA-Z0-9_-]{11})"`)
-	shorts := shortsRe.FindAllStringSubmatchIndex(html, -1)
-	for _, idx := range shorts {
-		if len(idx) < 4 { continue }
-		id := html[idx[2]:idx[3]]
-		if _, ok := seen[id]; ok { continue }
-		seen[id] = struct{}{}
-
-		start := idx[0]
-		if start-2000 > 0 { start = start - 2000 }
-		end := idx[1] + 8000
-		if end > len(html) { end = len(html) }
-		snippet := html[start:end]
-
-		vi := VideoItem{VideoID: id}
-		// Prefer deterministic thumbnail URL for shorts as well
-		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
-		if m := regexp.MustCompile(`"headline":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.Title = unescapeYT(m[1])
-		} else if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-			vi.Title = unescapeYT(m[1])
-		}
-		if vi.ThumbnailURL == "" {
-			if m := regexp.MustCompile(`"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
-				vi.ThumbnailURL = normalizeThumbURL(unescapeYT(m[1]))
-			}
-		}
-		videos = append(videos, vi)
+	// --- FALLBACK: If JSON parsing yields no videos, use regex patterns ---
+	if len(videos) == 0 {
+		log.Println("JSON extraction yielded no videos, falling back to regex patterns")
+		videos = extractVideosWithRegex(html)
 	}
 
+	// --- Channel metadata extraction ---
 	// Attempt to derive a displayable channel handle/name
 	channelDisplay := handle
 	// Try to extract canonicalBaseUrl if present
-	canRe := regexp.MustCompile(`"canonicalBaseUrl":"\\/(@[^\"]+)"`)
-	if m := canRe.FindStringSubmatch(html); len(m) >= 2 {
-		channelDisplay = m[1]
+	if canRe := regexp.MustCompile(`"canonicalBaseUrl":"\\/(@[^\"]+)"`).FindStringSubmatch(html); len(canRe) >= 2 {
+		channelDisplay = canRe[1]
 	}
 
 	// Extract subscribers (header section)
@@ -280,29 +399,27 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 	} else {
 		// Try runs: join all text segments inside subscriberCountText.runs
 		if loc := regexp.MustCompile(`"subscriberCountText":\{"runs":\[`).FindStringIndex(html); loc != nil {
-			// Take a slice starting at runs and limited length
 			slice := html[loc[1]:]
-			// Find the closing ]
 			if endIdx := strings.Index(slice, "]}"); endIdx != -1 {
 				runsChunk := slice[:endIdx]
-				// Collect all text fields inside runs
 				texts := regexp.MustCompile(`"text":"([^"]+)"`).FindAllStringSubmatch(runsChunk, -1)
 				var parts []string
 				for _, t := range texts {
-					if len(t) >= 2 { parts = append(parts, unescapeYT(t[1])) }
+					if len(t) >= 2 {
+						parts = append(parts, unescapeYT(t[1]))
+					}
 				}
 				subText = strings.Join(parts, "")
 			}
 		}
 	}
-	// Fallbacks: approximateSubscriberCount or localized patterns like "131 odběratelů"
+	// Fallbacks: approximateSubscriberCount or localized patterns
 	if subText == "" {
 		if m := regexp.MustCompile(`"approximateSubscriberCount":"([^"]+)"`).FindStringSubmatch(html); len(m) >= 2 {
 			subText = m[1]
 		}
 	}
 	if subText == "" {
-		// Case-insensitive; match digits with optional spaces/commas/dots before localized label
 		if m := regexp.MustCompile(`(?i)([0-9][0-9\s\.,]*)\s*(odběratel(?:é|ů)?|subscribers?)`).FindStringSubmatch(html); len(m) >= 2 {
 			subText = strings.TrimSpace(m[0])
 		}
@@ -310,19 +427,174 @@ func fetchChannelVideos(channelInput string) (ChannelVideosResponse, error) {
 	subs := parseCountText(subText)
 
 	res := ChannelVideosResponse{
-		Channel:    channelDisplay,
-		ChannelURL: channelURL,
-		SubscribersText: subText,
-		Subscribers:     subs,
-		Videos:          videos,
+		Channel:            channelDisplay,
+		ChannelURL:         channelURL,
+		ChannelID:          channelID,
+		ChannelAvatar:      channelAvatar,
+		ChannelDescription: channelDesc,
+		RSSURL:             rssURL,
+		SubscribersText:    subText,
+		Subscribers:        subs,
+		Videos:             videos,
 	}
 	return res, nil
+}
+
+// extractVideosWithRegex is the fallback method that uses regex patterns
+// to extract video data when JSON parsing fails or yields no results.
+func extractVideosWithRegex(html string) []VideoItem {
+	seen := make(map[string]struct{})
+	var videos []VideoItem
+
+	// Method 1: Find video IDs from thumbnail URLs (current YouTube structure)
+	vidRe := regexp.MustCompile(`i\.ytimg\.com/vi/([a-zA-Z0-9_-]{11})`)
+	matches := vidRe.FindAllStringSubmatchIndex(html, -1)
+	for _, idx := range matches {
+		if len(idx) < 4 {
+			continue
+		}
+		id := html[idx[2]:idx[3]]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		start := idx[0]
+		if start-3000 > 0 {
+			start = start - 3000
+		}
+		end := idx[1] + 10000
+		if end > len(html) {
+			end = len(html)
+		}
+		snippet := html[start:end]
+
+		vi := VideoItem{VideoID: id}
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
+
+		// Title from accessibilityContext.label
+		if m := regexp.MustCompile(`"accessibilityContext":\{[^}]*"label":"([^"]{15,})"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			title := unescapeYT(m[1])
+			durationRe := regexp.MustCompile(`\s+\d+\s+(?:minute|second|hour)s?(?:,\s*\d+\s+(?:minute|second|hour)s?)*\s*$`)
+			title = durationRe.ReplaceAllString(title, "")
+			vi.Title = strings.TrimSpace(title)
+		} else if m := regexp.MustCompile(`"metadata":\{[^}]*"content":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			content := unescapeYT(m[1])
+			if content != "Share" {
+				vi.Title = content
+			}
+		}
+
+		// Length
+		if m := regexp.MustCompile(`"thumbnailBottomOverlayViewModel":\{[^}]*"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Length = m[1]
+		} else if m := regexp.MustCompile(`"lengthText":\{[^}]*"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Length = m[1]
+		}
+
+		// Published time
+		if m := regexp.MustCompile(`"publishedTimeText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.PublishedText = m[1]
+			vi.PublishedDate = parseRelativeToISO(m[1])
+		}
+
+		// Views
+		if m := regexp.MustCompile(`"viewCountText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.ViewsText = m[1]
+			vi.Views = parseCountText(m[1])
+		}
+
+		videos = append(videos, vi)
+	}
+
+	// Method 2: Old videoRenderer structure (for backwards compatibility)
+	oldRe := regexp.MustCompile(`"videoRenderer":\{[^}]*?"videoId":"([a-zA-Z0-9_-]{11})"`)
+	oldMatches := oldRe.FindAllStringSubmatchIndex(html, -1)
+	for _, idx := range oldMatches {
+		if len(idx) < 4 {
+			continue
+		}
+		id := html[idx[2]:idx[3]]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		start := idx[0]
+		if start-2000 > 0 {
+			start = start - 2000
+		}
+		end := idx[1] + 8000
+		if end > len(html) {
+			end = len(html)
+		}
+		snippet := html[start:end]
+
+		vi := VideoItem{VideoID: id}
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
+
+		if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Title = unescapeYT(m[1])
+		} else if m := regexp.MustCompile(`"title":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Title = unescapeYT(m[1])
+		}
+		if m := regexp.MustCompile(`"lengthText":\{[^}]*"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Length = m[1]
+		}
+		if m := regexp.MustCompile(`"publishedTimeText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.PublishedText = m[1]
+			vi.PublishedDate = parseRelativeToISO(m[1])
+		}
+		if m := regexp.MustCompile(`"viewCountText":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.ViewsText = m[1]
+			vi.Views = parseCountText(m[1])
+		}
+
+		videos = append(videos, vi)
+	}
+
+	// Method 3: Shorts videos (reelItemRenderer)
+	shortsRe := regexp.MustCompile(`"reelItemRenderer":\{[^}]*?"videoId":"([a-zA-Z0-9_-]{11})"`)
+	shorts := shortsRe.FindAllStringSubmatchIndex(html, -1)
+	for _, idx := range shorts {
+		if len(idx) < 4 {
+			continue
+		}
+		id := html[idx[2]:idx[3]]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		start := idx[0]
+		if start-2000 > 0 {
+			start = start - 2000
+		}
+		end := idx[1] + 8000
+		if end > len(html) {
+			end = len(html)
+		}
+		snippet := html[start:end]
+
+		vi := VideoItem{VideoID: id}
+		vi.ThumbnailURL = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", id)
+		if m := regexp.MustCompile(`"headline":\{"simpleText":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Title = unescapeYT(m[1])
+		} else if m := regexp.MustCompile(`"title":\{"runs":\[\{"text":"([^"]+)"`).FindStringSubmatch(snippet); len(m) >= 2 {
+			vi.Title = unescapeYT(m[1])
+		}
+		videos = append(videos, vi)
+	}
+
+	return videos
 }
 
 // unescapeYT fixes escaped sequences in YouTube HTML JSON strings
 func unescapeYT(s string) string {
 	s = strings.ReplaceAll(s, `\/`, `/`)
 	s = strings.ReplaceAll(s, `\u0026`, `&`)
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\\`, `\`)
 	return s
 }
 
@@ -421,13 +693,19 @@ func parseLocalizedDuration(s string) string {
 
 	// Czech capture
 	if mm := regexp.MustCompile(`(\d+)\s*hodin(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
-		if h == 0 { h, _ = strconv.Atoi(mm[1]) }
+		if h == 0 {
+			h, _ = strconv.Atoi(mm[1])
+		}
 	}
 	if mm := regexp.MustCompile(`(\d+)\s*minut(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
-		if m == 0 { m, _ = strconv.Atoi(mm[1]) }
+		if m == 0 {
+			m, _ = strconv.Atoi(mm[1])
+		}
 	}
 	if mm := regexp.MustCompile(`(\d+)\s*sekund(?:a|y)?`).FindStringSubmatch(t); len(mm) >= 2 {
-		if sec == 0 { sec, _ = strconv.Atoi(mm[1]) }
+		if sec == 0 {
+			sec, _ = strconv.Atoi(mm[1])
+		}
 	}
 
 	// If we still didn't parse anything but string contains a plain number like "5 minutes",
@@ -677,5 +955,5 @@ func main() {
 	mux.HandleFunc("/channel_videos", channelVideosHandler)
 
 	log.Println("Server starting on :7857...")
-	log.Fatal(http.ListenAndServe(":7857", handlerWithCORS))
+	log.Fatal(http.ListenAndServe("0.0.0.0:7857", handlerWithCORS))
 }
