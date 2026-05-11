@@ -145,7 +145,7 @@ func findVideosInJSON(data interface{}) []VideoItem {
 		switch val := v.(type) {
 		case map[string]interface{}:
 			// Check if this object represents a video by looking for videoId patterns
-			// or lockupViewModel-like structure with contentId
+			// or lockupViewModel-like structure with contentId.
 			vid := extractVideoFromObject(val)
 			if vid.VideoID != "" {
 				if _, ok := seen[vid.VideoID]; !ok {
