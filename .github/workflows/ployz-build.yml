@@ -4,13 +4,13 @@ on:
     inputs:
       build: { required: true, type: string }
       cloud: { required: true, type: string }
-      runner: { required: false, type: string, default: ubuntu-latest }
+      runner: { required: false, type: string, default: self-hosted }
 permissions:
   contents: read
   id-token: write
 jobs:
   build:
-    runs-on: ${{ inputs.runner }}
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: getployz/build@v1
         with:
